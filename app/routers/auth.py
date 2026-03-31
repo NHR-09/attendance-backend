@@ -61,13 +61,14 @@ async def login(payload: EmployeeLogin, db: AsyncSession = Depends(get_db)):
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account deactivated")
 
-    token = create_access_token({"sub": user.id, "role": user.role.value})
+    role_val = user.role.value if hasattr(user.role, "value") else user.role
+    token = create_access_token({"sub": str(user.id), "role": role_val})
 
     await log_event(db, user.id, "login", "employee", user.id)
 
     return TokenResponse(
         access_token=token,
-        role=user.role.value,
+        role=role_val,
         employee_id=user.employee_id,
         name=user.name,
     )
