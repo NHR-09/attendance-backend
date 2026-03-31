@@ -1,0 +1,294 @@
+"""
+Attendance router — check-in, check-out, status, history.
+"""
+from datetime import datetime, date
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, and_
+import os, uuid
+
+from app.database import get_db
+from app.config import get_settings
+from app.models.models import (
+    Employee, AttendanceLog, DeviceBinding, PhotoEvidence,
+    AttendanceMethod, AttendanceStatus,
+)
+from app.schemas.schemas import CheckInRequest, CheckOutRequest, AttendanceLogOut
+from app.utils.auth import get_current_user
+from app.services.audit_service import log_event
+from app.services.face_service import generate_face_encoding, compare_faces
+from app.services.location_service import validate_location
+
+router = APIRouter(prefix="/api/attendance", tags=["Attendance"])
+settings = get_settings()
+
+
+async def _verify_device(db: AsyncSession, employee: Employee, device_id: str):
+    """Ensure the device is bound to this employee."""
+    result = await db.execute(
+        select(DeviceBinding).where(
+            and_(
+                DeviceBinding.employee_id == employee.id,
+                DeviceBinding.device_id == device_id,
+                DeviceBinding.is_active == True,
+            )
+        )
+    )
+    binding = result.scalar_one_or_none()
+    if not binding:
+        raise HTTPException(
+            status_code=403,
+            detail="Device not registered. Please bind this device first or contact your manager.",
+        )
+    return binding
+
+
+@router.post("/check-in", response_model=AttendanceLogOut)
+async def check_in(
+    device_id: str = Form(...),
+    method: str = Form("face"),
+    confidence_score: float = Form(None),
+    location_lat: float = Form(None),
+    location_lng: float = Form(None),
+    photo: UploadFile = File(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: Employee = Depends(get_current_user),
+):
+    # 1. Verify device binding
+    await _verify_device(db, current_user, device_id)
+
+    # 2. Check if already checked in today
+    today = date.today()
+    existing = await db.execute(
+        select(AttendanceLog).where(
+            and_(
+                AttendanceLog.employee_id == current_user.id,
+                AttendanceLog.date == today,
+            )
+        )
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="Already checked in today")
+
+    # 3. Process face or location
+    final_confidence = confidence_score
+    att_method = AttendanceMethod.FACE if method == "face" else AttendanceMethod.LOCATION
+
+    if method == "face" and photo:
+        image_bytes = await photo.read()
+        live_encoding = generate_face_encoding(image_bytes)
+        matched, conf = compare_faces(current_user.face_encoding, live_encoding)
+        final_confidence = conf
+        if not matched:
+            att_method = AttendanceMethod.LOCATION  # will try fallback
+    elif method == "location":
+        if location_lat is None or location_lng is None:
+            raise HTTPException(status_code=400, detail="Location coordinates required for fallback")
+        within, dist = validate_location(location_lat, location_lng)
+        if not within:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Outside allowed area. Distance: {dist}m",
+            )
+
+    # 4. Save attendance
+    log = AttendanceLog(
+        employee_id=current_user.id,
+        date=today,
+        check_in_time=datetime.utcnow(),
+        confidence_score=final_confidence,
+        method=att_method,
+        status=AttendanceStatus.PRESENT,
+        device_id=device_id,
+        location_lat=location_lat,
+        location_lng=location_lng,
+    )
+    db.add(log)
+    await db.flush()
+    await db.refresh(log)
+
+    # 5. Save photo evidence
+    if photo:
+        await photo.seek(0)
+        image_bytes = await photo.read()
+        os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
+        filename = f"{uuid.uuid4().hex}.jpg"
+        filepath = os.path.join(settings.UPLOAD_DIR, filename)
+        with open(filepath, "wb") as f:
+            f.write(image_bytes)
+
+        evidence = PhotoEvidence(
+            attendance_log_id=log.id,
+            image_path=filepath,
+            confidence_score=final_confidence,
+            is_low_confidence=(final_confidence or 0) < 80,
+        )
+        db.add(evidence)
+
+    await log_event(db, current_user.id, "check_in", "attendance_log", log.id)
+
+    return AttendanceLogOut(
+        id=log.id,
+        employee_id=log.employee_id,
+        employee_name=current_user.name,
+        employee_code=current_user.employee_id,
+        date=log.date,
+        check_in_time=log.check_in_time,
+        check_out_time=log.check_out_time,
+        confidence_score=log.confidence_score,
+        method=log.method.value,
+        status=log.status.value,
+        device_id=log.device_id,
+        location_lat=log.location_lat,
+        location_lng=log.location_lng,
+        notes=log.notes,
+        created_at=log.created_at,
+    )
+
+
+@router.post("/check-out", response_model=AttendanceLogOut)
+async def check_out(
+    device_id: str = Form(...),
+    method: str = Form("face"),
+    confidence_score: float = Form(None),
+    photo: UploadFile = File(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: Employee = Depends(get_current_user),
+):
+    await _verify_device(db, current_user, device_id)
+
+    today = date.today()
+    result = await db.execute(
+        select(AttendanceLog).where(
+            and_(
+                AttendanceLog.employee_id == current_user.id,
+                AttendanceLog.date == today,
+            )
+        )
+    )
+    log = result.scalar_one_or_none()
+    if not log:
+        raise HTTPException(status_code=400, detail="No check-in found for today")
+    if log.check_out_time:
+        raise HTTPException(status_code=400, detail="Already checked out today")
+
+    # Face verification for checkout
+    final_confidence = confidence_score
+    if method == "face" and photo:
+        image_bytes = await photo.read()
+        live_encoding = generate_face_encoding(image_bytes)
+        matched, conf = compare_faces(current_user.face_encoding, live_encoding)
+        final_confidence = conf
+
+    log.check_out_time = datetime.utcnow()
+    log.confidence_score = final_confidence or log.confidence_score
+
+    # Save checkout photo
+    if photo:
+        await photo.seek(0)
+        image_bytes = await photo.read()
+        os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
+        filename = f"{uuid.uuid4().hex}_out.jpg"
+        filepath = os.path.join(settings.UPLOAD_DIR, filename)
+        with open(filepath, "wb") as f:
+            f.write(image_bytes)
+
+        evidence = PhotoEvidence(
+            attendance_log_id=log.id,
+            image_path=filepath,
+            confidence_score=final_confidence,
+            is_low_confidence=(final_confidence or 0) < 80,
+        )
+        db.add(evidence)
+
+    await log_event(db, current_user.id, "check_out", "attendance_log", log.id)
+
+    return AttendanceLogOut(
+        id=log.id,
+        employee_id=log.employee_id,
+        employee_name=current_user.name,
+        employee_code=current_user.employee_id,
+        date=log.date,
+        check_in_time=log.check_in_time,
+        check_out_time=log.check_out_time,
+        confidence_score=log.confidence_score,
+        method=log.method.value,
+        status=log.status.value,
+        device_id=log.device_id,
+        location_lat=log.location_lat,
+        location_lng=log.location_lng,
+        notes=log.notes,
+        created_at=log.created_at,
+    )
+
+
+@router.get("/status/today", response_model=AttendanceLogOut | None)
+async def get_today_status(
+    db: AsyncSession = Depends(get_db),
+    current_user: Employee = Depends(get_current_user),
+):
+    today = date.today()
+    result = await db.execute(
+        select(AttendanceLog).where(
+            and_(
+                AttendanceLog.employee_id == current_user.id,
+                AttendanceLog.date == today,
+            )
+        )
+    )
+    log = result.scalar_one_or_none()
+    if not log:
+        return None
+
+    return AttendanceLogOut(
+        id=log.id,
+        employee_id=log.employee_id,
+        employee_name=current_user.name,
+        employee_code=current_user.employee_id,
+        date=log.date,
+        check_in_time=log.check_in_time,
+        check_out_time=log.check_out_time,
+        confidence_score=log.confidence_score,
+        method=log.method.value,
+        status=log.status.value,
+        device_id=log.device_id,
+        location_lat=log.location_lat,
+        location_lng=log.location_lng,
+        notes=log.notes,
+        created_at=log.created_at,
+    )
+
+
+@router.get("/history", response_model=list[AttendanceLogOut])
+async def get_history(
+    limit: int = 30,
+    db: AsyncSession = Depends(get_db),
+    current_user: Employee = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(AttendanceLog)
+        .where(AttendanceLog.employee_id == current_user.id)
+        .order_by(AttendanceLog.date.desc())
+        .limit(limit)
+    )
+    logs = result.scalars().all()
+    return [
+        AttendanceLogOut(
+            id=l.id,
+            employee_id=l.employee_id,
+            employee_name=current_user.name,
+            employee_code=current_user.employee_id,
+            date=l.date,
+            check_in_time=l.check_in_time,
+            check_out_time=l.check_out_time,
+            confidence_score=l.confidence_score,
+            method=l.method.value,
+            status=l.status.value,
+            device_id=l.device_id,
+            location_lat=l.location_lat,
+            location_lng=l.location_lng,
+            notes=l.notes,
+            created_at=l.created_at,
+        )
+        for l in logs
+    ]
