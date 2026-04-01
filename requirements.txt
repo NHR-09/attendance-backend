@@ -12,6 +12,5 @@ opencv-python-headless>=4.10.0.84
 pydantic[email]>=2.9.1
 pydantic-settings>=2.5.2
 python-dotenv>=1.0.1
-deepface>=0.0.93
-tf-keras>=2.16.0
+
 
