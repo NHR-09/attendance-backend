@@ -90,8 +90,17 @@ async def enroll_face(
     current_user: Employee = Depends(get_current_user),
 ):
     image_bytes = await photo.read()
-    encoding = generate_face_encoding(image_bytes)
+    try:
+        encoding = generate_face_encoding(image_bytes)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Face enrollment failed. Please try again with a clear, well-lit selfie.",
+        )
     current_user.face_encoding = encoding
+    current_user.has_face_enrolled = True
     await db.flush()
 
     await log_event(db, current_user.id, "face_enroll", "employee", current_user.id)
