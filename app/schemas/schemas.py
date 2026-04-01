@@ -171,3 +171,12 @@ class DashboardSummary(BaseModel):
     not_checked_out: int
     exceptions: int
     low_confidence_count: int
+
+
+# ── Manual Attendance ──────────────────────────────────────────────
+class ManualAttendanceCreate(BaseModel):
+    employee_id: int
+    date: date
+    status: str = "present"  # present, absent, exception
+    notes: str = ""
+

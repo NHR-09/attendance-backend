@@ -14,7 +14,7 @@ from app.models.models import (
 )
 from app.schemas.schemas import (
     AttendanceLogOut, AttendanceUpdate, PhotoEvidenceOut,
-    AuditEventOut, DashboardSummary,
+    AuditEventOut, DashboardSummary, ManualAttendanceCreate,
 )
 from app.utils.auth import require_role
 from app.services.audit_service import log_event
@@ -229,3 +229,110 @@ async def get_audit_trail(
         select(AuditEvent).order_by(AuditEvent.timestamp.desc()).limit(limit)
     )
     return result.scalars().all()
+
+
+# ── Manual Attendance ───────────────────────────────────────────────
+@router.post("/attendance/manual", response_model=AttendanceLogOut)
+async def mark_manual_attendance(
+    payload: ManualAttendanceCreate,
+    db: AsyncSession = Depends(get_db),
+    manager: Employee = Depends(require_role("manager", "admin")),
+):
+    from app.models.models import DeviceBinding
+    from datetime import datetime
+
+    # Check employee exists
+    emp_result = await db.execute(select(Employee).where(Employee.id == payload.employee_id))
+    emp = emp_result.scalar_one_or_none()
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    # Check if log already exists for that date
+    existing = await db.execute(
+        select(AttendanceLog).where(
+            and_(
+                AttendanceLog.employee_id == payload.employee_id,
+                AttendanceLog.date == payload.date,
+            )
+        )
+    )
+    log = existing.scalar_one_or_none()
+
+    status_map = {
+        "present": AttendanceStatus.PRESENT,
+        "absent": AttendanceStatus.ABSENT,
+        "exception": AttendanceStatus.EXCEPTION,
+    }
+    att_status = status_map.get(payload.status, AttendanceStatus.PRESENT)
+
+    if log:
+        old_status = log.status.value
+        log.status = att_status
+        log.notes = (log.notes or "") + f" [Manual: {payload.notes}]"
+        await log_event(
+            db, manager.id, "manual_attendance", "attendance_log", log.id,
+            old_status, att_status.value, payload.notes,
+        )
+    else:
+        log = AttendanceLog(
+            employee_id=payload.employee_id,
+            date=payload.date,
+            status=att_status,
+            notes=f"[Manual: {payload.notes}]",
+        )
+        if att_status == AttendanceStatus.PRESENT:
+            log.check_in_time = datetime.utcnow()
+        db.add(log)
+        await db.flush()
+        await db.refresh(log)
+        await log_event(
+            db, manager.id, "manual_attendance", "attendance_log", log.id,
+            None, att_status.value, payload.notes,
+        )
+
+    return AttendanceLogOut(
+        id=log.id,
+        employee_id=log.employee_id,
+        employee_name=emp.name,
+        employee_code=emp.employee_id,
+        date=log.date,
+        check_in_time=log.check_in_time,
+        check_out_time=log.check_out_time,
+        confidence_score=log.confidence_score,
+        method=log.method.value if log.method else "face",
+        status=log.status.value,
+        device_id=log.device_id,
+        location_lat=log.location_lat,
+        location_lng=log.location_lng,
+        notes=log.notes or "",
+        created_at=log.created_at,
+    )
+
+
+# ── Employee Devices ────────────────────────────────────────────────
+@router.get("/devices")
+async def list_employee_devices(
+    db: AsyncSession = Depends(get_db),
+    _manager: Employee = Depends(require_role("manager", "admin")),
+):
+    from app.models.models import DeviceBinding
+
+    result = await db.execute(
+        select(DeviceBinding).where(DeviceBinding.is_active == True)
+    )
+    bindings = result.scalars().all()
+
+    devices = []
+    for b in bindings:
+        emp_result = await db.execute(select(Employee).where(Employee.id == b.employee_id))
+        emp = emp_result.scalar_one_or_none()
+        devices.append({
+            "id": b.id,
+            "employee_id": b.employee_id,
+            "employee_name": emp.name if emp else "Unknown",
+            "device_id": b.device_id,
+            "device_name": b.device_name,
+            "bound_at": b.bound_at.isoformat() if b.bound_at else None,
+        })
+    return devices
+
