@@ -27,7 +27,7 @@ DEFAULT_POLICIES = {
 @router.get("/", response_model=list[PolicyConfigOut])
 async def list_policies(
     db: AsyncSession = Depends(get_db),
-    _user: Employee = Depends(get_current_user),
+    _user: Employee = Depends(require_role("manager", "admin")),
 ):
     result = await db.execute(select(PolicyConfig).order_by(PolicyConfig.key))
     policies = result.scalars().all()

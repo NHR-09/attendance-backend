@@ -69,6 +69,13 @@ async def check_in(
     # 1. Verify device binding
     await _verify_device(db, current_user, device_id)
 
+    # 1b. Require face enrollment before check-in
+    if current_user.face_encoding is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Face not enrolled. Please enroll your face from the Profile tab before checking in.",
+        )
+
     # 2. Check if already checked in today
     today = date.today()
     existing = await db.execute(

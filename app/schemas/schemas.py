@@ -1,5 +1,5 @@
 from datetime import datetime, date
-from typing import Optional
+from typing import Optional, Literal
 from pydantic import BaseModel, EmailStr
 
 
@@ -50,7 +50,7 @@ class EmployeeOut(BaseModel):
 class EmployeeUpdate(BaseModel):
     name: Optional[str] = None
     department: Optional[str] = None
-    role: Optional[str] = None
+    role: Optional[Literal["employee", "manager", "admin"]] = None
     is_active: Optional[bool] = None
 
 

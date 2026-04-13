@@ -25,13 +25,16 @@ async def register(payload: EmployeeCreate, db: AsyncSession = Depends(get_db)):
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Email or Employee ID already registered")
 
+    # Security: always force role to EMPLOYEE on public registration.
+    # Only admins can promote users via the update endpoint.
+    from app.models.models import UserRole
     employee = Employee(
         employee_id=payload.employee_id,
         name=payload.name,
         email=payload.email,
         password_hash=hash_password(payload.password),
         department=payload.department,
-        role=payload.role,
+        role=UserRole.EMPLOYEE,
     )
     db.add(employee)
     await db.flush()

@@ -27,7 +27,7 @@ def _detect_and_crop_face(img: np.ndarray, target_size: int = 160) -> np.ndarray
     """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     cascade = _get_face_cascade()
-    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=3, minSize=(30, 30))
 
     if len(faces) == 0:
         raise ValueError("No face detected. Please ensure your face is clearly visible.")
@@ -154,13 +154,13 @@ def check_liveness(image_bytes: bytes) -> bool:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
         cascade = _get_face_cascade()
-        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=3, minSize=(30, 30))
         if len(faces) != 1:
             return False
 
-        # Blur detection (Laplacian variance)
+        # Blur detection (Laplacian variance) — lower threshold for budget phone cameras
         laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-        if laplacian_var < 50:
+        if laplacian_var < 20:
             return False
 
         return True

@@ -207,10 +207,16 @@ async def export_excel(
     result = await db.execute(query)
     logs = result.scalars().all()
 
+    # Batch-fetch employees to avoid N+1
+    emp_ids = list({l.employee_id for l in logs})
+    emp_map = {}
+    if emp_ids:
+        emp_result = await db.execute(select(Employee).where(Employee.id.in_(emp_ids)))
+        emp_map = {e.id: e for e in emp_result.scalars().all()}
+
     records = []
     for l in logs:
-        emp_result = await db.execute(select(Employee).where(Employee.id == l.employee_id))
-        emp = emp_result.scalar_one_or_none()
+        emp = emp_map.get(l.employee_id)
         records.append({
             "employee_name": emp.name if emp else "Unknown",
             "employee_id": emp.employee_id if emp else "",
@@ -336,10 +342,16 @@ async def list_employee_devices(
     )
     bindings = result.scalars().all()
 
+    # Batch-fetch employees to avoid N+1
+    emp_ids = list({b.employee_id for b in bindings})
+    emp_map = {}
+    if emp_ids:
+        emp_result = await db.execute(select(Employee).where(Employee.id.in_(emp_ids)))
+        emp_map = {e.id: e for e in emp_result.scalars().all()}
+
     devices = []
     for b in bindings:
-        emp_result = await db.execute(select(Employee).where(Employee.id == b.employee_id))
-        emp = emp_result.scalar_one_or_none()
+        emp = emp_map.get(b.employee_id)
         devices.append({
             "id": b.id,
             "employee_id": b.employee_id,
