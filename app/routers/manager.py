@@ -56,11 +56,18 @@ async def dashboard_summary(
     exception_count = exceptions.scalar() or 0
 
     low_conf = await db.execute(
-        select(func.count(PhotoEvidence.id)).where(PhotoEvidence.is_low_confidence == True)
+        select(func.count(PhotoEvidence.id))
+        .join(AttendanceLog, PhotoEvidence.attendance_log_id == AttendanceLog.id)
+        .where(and_(AttendanceLog.date == today, PhotoEvidence.is_low_confidence == True))
     )
     low_confidence_count = low_conf.scalar() or 0
 
-    absent_today = total_employees - present_today - not_checked_out - exception_count
+    absent = await db.execute(
+        select(func.count(AttendanceLog.id)).where(
+            and_(AttendanceLog.date == today, AttendanceLog.status == AttendanceStatus.ABSENT)
+        )
+    )
+    absent_today = absent.scalar() or 0
 
     return DashboardSummary(
         total_employees=total_employees,
@@ -89,16 +96,23 @@ async def list_attendance(
     if employee_id:
         query = query.where(AttendanceLog.employee_id == employee_id)
     if status_filter:
-        query = query.where(AttendanceLog.status == status_filter)
+        try:
+            query = query.where(AttendanceLog.status == AttendanceStatus(status_filter))
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid status: {status_filter}")
 
     query = query.limit(limit)
     result = await db.execute(query)
     logs = result.scalars().all()
 
     output = []
+    emp_ids = list({l.employee_id for l in logs})
+    emp_map = {}
+    if emp_ids:
+        emp_result = await db.execute(select(Employee).where(Employee.id.in_(emp_ids)))
+        emp_map = {e.id: e for e in emp_result.scalars().all()}
     for l in logs:
-        emp_result = await db.execute(select(Employee).where(Employee.id == l.employee_id))
-        emp = emp_result.scalar_one_or_none()
+        emp = emp_map.get(l.employee_id)
         output.append(AttendanceLogOut(
             id=l.id,
             employee_id=l.employee_id,

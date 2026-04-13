@@ -14,12 +14,14 @@ if database_url.startswith("postgresql://"):
 elif database_url.startswith("postgres://"):
     database_url = database_url.replace("postgres://", "postgresql+asyncpg://", 1)
 
-# asyncpg doesn't support "sslmode" query param — strip it and pass ssl via connect_args
+# asyncpg doesn't support "sslmode" or "channel_binding" query params — strip them
 connect_args = {}
-if "sslmode" in database_url:
+unsupported_params = ("sslmode", "channel_binding")
+if any(p in database_url for p in unsupported_params):
     parsed = urlparse(database_url)
     params = parse_qs(parsed.query)
     ssl_mode = params.pop("sslmode", [None])
+    params.pop("channel_binding", None)
     if ssl_mode and ssl_mode[0] in ("require", "verify-ca", "verify-full"):
         ssl_ctx = _ssl.create_default_context()
         ssl_ctx.check_hostname = False

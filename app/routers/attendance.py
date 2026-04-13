@@ -11,20 +11,32 @@ from app.database import get_db
 from app.config import get_settings
 from app.models.models import (
     Employee, AttendanceLog, DeviceBinding, PhotoEvidence,
-    AttendanceMethod, AttendanceStatus,
+    PolicyConfig, AttendanceMethod, AttendanceStatus,
 )
 from app.schemas.schemas import CheckInRequest, CheckOutRequest, AttendanceLogOut
 from app.utils.auth import get_current_user
 from app.services.audit_service import log_event
-from app.services.face_service import generate_face_encoding, compare_faces
+from app.services.face_service import generate_face_encoding, compare_faces, check_liveness
 from app.services.location_service import validate_location
 
 router = APIRouter(prefix="/api/attendance", tags=["Attendance"])
 settings = get_settings()
 
 
+async def _get_policy(db: AsyncSession, key: str, default: str) -> str:
+    r = await db.execute(select(PolicyConfig).where(PolicyConfig.key == key))
+    p = r.scalar_one_or_none()
+    return p.value if p else default
+
+
+async def _get_geofence(db: AsyncSession):
+    lat = float(await _get_policy(db, "geofence_lat", "28.6139"))
+    lng = float(await _get_policy(db, "geofence_lng", "77.2090"))
+    radius = float(await _get_policy(db, "geofence_radius", "200"))
+    return lat, lng, radius
+
+
 async def _verify_device(db: AsyncSession, employee: Employee, device_id: str):
-    """Ensure the device is bound to this employee."""
     result = await db.execute(
         select(DeviceBinding).where(
             and_(
@@ -70,25 +82,48 @@ async def check_in(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Already checked in today")
 
-    # 3. Process face or location
+    # 3. Read policy values
+    threshold = float(await _get_policy(db, "confidence_threshold", "0.6")) * 100
+    geo_lat, geo_lng, geo_radius = await _get_geofence(db)
+
     final_confidence = confidence_score
     att_method = AttendanceMethod.FACE if method == "face" else AttendanceMethod.LOCATION
 
     if method == "face" and photo:
         image_bytes = await photo.read()
+
+        # Bug #10: liveness check
+        if not check_liveness(image_bytes):
+            raise HTTPException(status_code=400, detail="Liveness check failed. Please use a live camera.")
+
         live_encoding = generate_face_encoding(image_bytes)
-        matched, conf = compare_faces(current_user.face_encoding, live_encoding)
+        matched, conf = compare_faces(current_user.face_encoding, live_encoding, threshold / 100)
         final_confidence = conf
+
         if not matched:
-            att_method = AttendanceMethod.LOCATION  # will try fallback
+            # Bug #1: face fail must validate location, not silently pass
+            if location_lat is None or location_lng is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Face verification failed ({conf:.1f}% confidence). Enable location fallback to proceed.",
+                )
+            within, dist = validate_location(location_lat, location_lng, geo_lat, geo_lng, geo_radius)
+            if not within:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Face failed and outside geofence ({dist:.0f}m away).",
+                )
+            att_method = AttendanceMethod.LOCATION
+
     elif method == "location":
         if location_lat is None or location_lng is None:
             raise HTTPException(status_code=400, detail="Location coordinates required for fallback")
-        within, dist = validate_location(location_lat, location_lng)
+        # Bug #2: use geofence values from DB
+        within, dist = validate_location(location_lat, location_lng, geo_lat, geo_lng, geo_radius)
         if not within:
             raise HTTPException(
                 status_code=400,
-                detail=f"Outside allowed area. Distance: {dist}m",
+                detail=f"Outside allowed area. Distance: {dist:.0f}m",
             )
 
     # 4. Save attendance
@@ -121,7 +156,7 @@ async def check_in(
             attendance_log_id=log.id,
             image_path=filepath,
             confidence_score=final_confidence,
-            is_low_confidence=(final_confidence or 0) < 80,
+            is_low_confidence=(final_confidence or 0) < threshold,
         )
         db.add(evidence)
 
@@ -172,18 +207,31 @@ async def check_out(
     if log.check_out_time:
         raise HTTPException(status_code=400, detail="Already checked out today")
 
-    # Face verification for checkout
+    # Bug #3: read threshold from DB
+    threshold = float(await _get_policy(db, "confidence_threshold", "0.6")) * 100
+
     final_confidence = confidence_score
     if method == "face" and photo:
         image_bytes = await photo.read()
+
+        # Bug #10: liveness check on checkout too
+        if not check_liveness(image_bytes):
+            raise HTTPException(status_code=400, detail="Liveness check failed.")
+
         live_encoding = generate_face_encoding(image_bytes)
-        matched, conf = compare_faces(current_user.face_encoding, live_encoding)
+        matched, conf = compare_faces(current_user.face_encoding, live_encoding, threshold / 100)
         final_confidence = conf
+
+        # Bug #4: reject failed face on checkout
+        if not matched:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Face verification failed ({conf:.1f}%). Please try again.",
+            )
 
     log.check_out_time = datetime.utcnow()
     log.confidence_score = final_confidence or log.confidence_score
 
-    # Save checkout photo
     if photo:
         await photo.seek(0)
         image_bytes = await photo.read()
@@ -197,7 +245,7 @@ async def check_out(
             attendance_log_id=log.id,
             image_path=filepath,
             confidence_score=final_confidence,
-            is_low_confidence=(final_confidence or 0) < 80,
+            is_low_confidence=(final_confidence or 0) < threshold,
         )
         db.add(evidence)
 

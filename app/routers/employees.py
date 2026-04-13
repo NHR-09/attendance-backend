@@ -100,7 +100,6 @@ async def enroll_face(
             detail="Face enrollment failed. Please try again with a clear, well-lit selfie.",
         )
     current_user.face_encoding = encoding
-    current_user.has_face_enrolled = True
     await db.flush()
 
     await log_event(db, current_user.id, "face_enroll", "employee", current_user.id)

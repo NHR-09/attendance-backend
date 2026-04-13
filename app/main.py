@@ -28,23 +28,23 @@ async def seed_accounts():
     accounts = [
         {
             "employee_id": "ADM-001",
-            "name": "Admin User",
+            "name": "Rohan Verma",
             "email": "admin@test.com",
             "password": "test1234",
-            "department": "Administration",
+            "department": "IT",
             "role": UserRole.ADMIN,
         },
         {
             "employee_id": "MGR-001",
-            "name": "Manager User",
+            "name": "Priya Sharma",
             "email": "manager@test.com",
             "password": "test1234",
-            "department": "Management",
+            "department": "HR",
             "role": UserRole.MANAGER,
         },
         {
             "employee_id": "EMP-101",
-            "name": "Employee User",
+            "name": "Aarav Patel",
             "email": "employee@test.com",
             "password": "test1234",
             "department": "Engineering",
