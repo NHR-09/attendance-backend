@@ -25,6 +25,9 @@ env/
 # Uploads (user data)
 uploads/
 
+# DNN models (auto-downloaded at runtime)
+models/
+
 # IDE
 .vscode/
 .idea/

@@ -1,99 +1,88 @@
 """
-Face verification service — OpenCV-powered (no TensorFlow required).
-Uses OpenCV DNN face detector + normalized pixel embeddings for matching.
-Lightweight enough for Render free tier.
+Face verification service — OpenCV DNN-powered.
+Uses YuNet face detector + SFace recognizer for identity-aware embeddings.
+Much more discriminative than basic HOG — can actually distinguish people.
 """
+import os
+import urllib.request
 import numpy as np
-from typing import Optional
 import cv2
+from typing import Optional
+
+# ── Model URLs (from OpenCV Zoo) ────────────────────────────────────
+_MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "models")
+
+_DETECTOR_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+_RECOGNIZER_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx"
+
+_DETECTOR_PATH = os.path.join(_MODEL_DIR, "face_detection_yunet_2023mar.onnx")
+_RECOGNIZER_PATH = os.path.join(_MODEL_DIR, "face_recognition_sface_2021dec.onnx")
+
+_detector = None
+_recognizer = None
 
 
-# ── Face Detection ──────────────────────────────────────────────────
-# Use OpenCV's Haar cascade (bundled with opencv-python-headless)
-_face_cascade = None
-
-def _get_face_cascade():
-    global _face_cascade
-    if _face_cascade is None:
-        _face_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        )
-    return _face_cascade
+def _ensure_models():
+    """Download DNN models if not cached locally."""
+    os.makedirs(_MODEL_DIR, exist_ok=True)
+    for url, path in [(_DETECTOR_URL, _DETECTOR_PATH), (_RECOGNIZER_URL, _RECOGNIZER_PATH)]:
+        if not os.path.exists(path):
+            print(f"[face_service] Downloading {os.path.basename(path)}...")
+            urllib.request.urlretrieve(url, path)
+            print(f"[face_service] Saved to {path}")
 
 
-def _detect_and_crop_face(img: np.ndarray, target_size: int = 160) -> np.ndarray:
-    """Detect a face and return a cropped, resized, grayscale face region.
+def _get_detector(width: int, height: int):
+    """Get or create YuNet face detector."""
+    global _detector
+    _ensure_models()
+    if _detector is None:
+        _detector = cv2.FaceDetectorYN.create(_DETECTOR_PATH, "", (width, height))
+    else:
+        _detector.setInputSize((width, height))
+    return _detector
+
+
+def _get_recognizer():
+    """Get or create SFace recognizer."""
+    global _recognizer
+    _ensure_models()
+    if _recognizer is None:
+        _recognizer = cv2.FaceRecognizerSF.create(_RECOGNIZER_PATH, "")
+    return _recognizer
+
+
+def _detect_face(img: np.ndarray) -> np.ndarray:
+    """Detect faces and return the largest face bounding info.
+    Returns the raw face detection array needed by SFace.
     Raises ValueError if no face detected.
     """
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    cascade = _get_face_cascade()
-    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=3, minSize=(30, 30))
+    h, w = img.shape[:2]
+    detector = _get_detector(w, h)
+    _, faces = detector.detect(img)
 
-    if len(faces) == 0:
-        raise ValueError("No face detected. Please ensure your face is clearly visible.")
+    if faces is None or len(faces) == 0:
+        raise ValueError("No face detected. Please ensure your face is clearly visible and well-lit.")
 
-    # Take the largest face
-    faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
-    x, y, w, h = faces[0]
-
-    # Add padding (20%)
-    pad = int(0.2 * max(w, h))
-    x1 = max(0, x - pad)
-    y1 = max(0, y - pad)
-    x2 = min(img.shape[1], x + w + pad)
-    y2 = min(img.shape[0], y + h + pad)
-
-    face_roi = gray[y1:y2, x1:x2]
-    # Resize to standard size and normalize
-    face_resized = cv2.resize(face_roi, (target_size, target_size))
-    return face_resized
+    # Take the largest face (by area = w*h)
+    areas = faces[:, 2] * faces[:, 3]
+    largest_idx = np.argmax(areas)
+    return faces[largest_idx]
 
 
-def _face_to_embedding(face_img: np.ndarray) -> np.ndarray:
-    """Convert a face image to a normalized embedding vector.
-    Uses histogram of oriented gradients (HOG) features + pixel stats.
-    """
-    # 1. Histogram equalization for lighting normalization
-    equalized = cv2.equalizeHist(face_img)
-
-    # 2. Compute HOG-like features using Sobel gradients
-    gx = cv2.Sobel(equalized, cv2.CV_64F, 1, 0, ksize=3)
-    gy = cv2.Sobel(equalized, cv2.CV_64F, 0, 1, ksize=3)
-    magnitude = np.sqrt(gx**2 + gy**2)
-    angle = np.arctan2(gy, gx)
-
-    # 3. Divide into 8x8 grid cells and compute gradient histograms
-    cell_size = face_img.shape[0] // 8
-    features = []
-    for i in range(8):
-        for j in range(8):
-            cell_mag = magnitude[i*cell_size:(i+1)*cell_size, j*cell_size:(j+1)*cell_size]
-            cell_ang = angle[i*cell_size:(i+1)*cell_size, j*cell_size:(j+1)*cell_size]
-            # 9-bin histogram of gradient orientations
-            hist, _ = np.histogram(cell_ang, bins=9, range=(-np.pi, np.pi), weights=cell_mag)
-            features.extend(hist)
-
-    # 4. Add pixel intensity statistics per cell
-    for i in range(8):
-        for j in range(8):
-            cell = equalized[i*cell_size:(i+1)*cell_size, j*cell_size:(j+1)*cell_size].astype(np.float64)
-            features.append(np.mean(cell))
-            features.append(np.std(cell))
-
-    embedding = np.array(features, dtype=np.float32)
-    # L2 normalize
-    norm = np.linalg.norm(embedding)
-    if norm > 0:
-        embedding = embedding / norm
-
-    return embedding
+def _align_and_embed(img: np.ndarray, face: np.ndarray) -> np.ndarray:
+    """Align face and extract 128-d embedding using SFace."""
+    recognizer = _get_recognizer()
+    aligned = recognizer.alignCrop(img, face)
+    embedding = recognizer.feature(aligned)
+    return embedding.flatten()
 
 
 # ── Public API ──────────────────────────────────────────────────────
 
 def generate_face_encoding(image_bytes: bytes) -> bytes:
-    """Extract a face embedding from image bytes.
-    Returns the embedding as raw bytes.
+    """Extract a 128-d face embedding from image bytes.
+    Returns the embedding as raw bytes (512 bytes = 128 x float32).
     Raises ValueError if no face is detected.
     """
     nparr = np.frombuffer(image_bytes, np.uint8)
@@ -101,9 +90,15 @@ def generate_face_encoding(image_bytes: bytes) -> bytes:
     if img is None:
         raise ValueError("Could not decode image")
 
-    face_img = _detect_and_crop_face(img)
-    embedding = _face_to_embedding(face_img)
-    return embedding.tobytes()
+    face = _detect_face(img)
+    embedding = _align_and_embed(img, face)
+
+    # L2-normalize for cosine similarity
+    norm = np.linalg.norm(embedding)
+    if norm > 0:
+        embedding = embedding / norm
+
+    return embedding.astype(np.float32).tobytes()
 
 
 def compare_faces(
@@ -113,6 +108,10 @@ def compare_faces(
 ) -> tuple[bool, float]:
     """Compare stored face embedding against live capture using cosine similarity.
     Returns (matched: bool, confidence: float 0-100).
+
+    SFace cosine similarity scores:
+    - Same person: typically 0.5 - 0.8+
+    - Different person: typically 0.0 - 0.3
     """
     if stored_encoding is None:
         return False, 0.0
@@ -124,13 +123,13 @@ def compare_faces(
         if stored.shape != live.shape:
             return False, 0.0
 
-        # Cosine similarity (embeddings are already L2-normalized)
+        # Cosine similarity (embeddings are L2-normalized)
         cosine_sim = float(np.dot(stored, live))
 
-        # Map cosine similarity to confidence percentage
-        # Typical same-person scores: 0.7-0.95
-        # Typical different-person scores: 0.3-0.6
-        confidence = max(0.0, min(100.0, cosine_sim * 100))
+        # Map to confidence percentage
+        # SFace cosine scores range ~0.0 to ~0.8
+        # Scale so that 0.4 similarity → ~60%, 0.6 → ~85%, 0.8 → ~100%
+        confidence = max(0.0, min(100.0, cosine_sim * 120))
         confidence = round(confidence, 2)
 
         matched = confidence >= (threshold * 100)
@@ -141,9 +140,10 @@ def compare_faces(
 
 
 def check_liveness(image_bytes: bytes) -> bool:
-    """Basic anti-spoofing checks:
+    """Anti-spoofing checks:
     1. Exactly one face detected (reject zero or multiple)
     2. Image not too blurry (reject screen photos)
+    3. Face is large enough in frame (reject distant/tiny faces)
     """
     try:
         nparr = np.frombuffer(image_bytes, np.uint8)
@@ -151,16 +151,24 @@ def check_liveness(image_bytes: bytes) -> bool:
         if img is None:
             return False
 
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        h, w = img.shape[:2]
+        detector = _get_detector(w, h)
+        _, faces = detector.detect(img)
 
-        cascade = _get_face_cascade()
-        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=3, minSize=(30, 30))
-        if len(faces) != 1:
+        if faces is None or len(faces) != 1:
             return False
 
-        # Blur detection (Laplacian variance) — lower threshold for budget phone cameras
+        face = faces[0]
+        face_w, face_h = face[2], face[3]
+
+        # Face must be at least 10% of image width (not too far away)
+        if face_w < w * 0.1 or face_h < h * 0.1:
+            return False
+
+        # Blur detection (Laplacian variance)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-        if laplacian_var < 20:
+        if laplacian_var < 15:
             return False
 
         return True
